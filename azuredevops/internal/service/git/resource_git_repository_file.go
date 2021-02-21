@@ -72,7 +72,7 @@ func ResourceGitRepositoryFile() *schema.Resource {
 				Description: "The branch name, defaults to \"master\"",
 				Default:     "refs/heads/master",
 			},
-			"comment": {
+			"commit_message": {
 				Type:        schema.TypeString,
 				Optional:    true,
 				Computed:    true,
@@ -88,13 +88,14 @@ func ResourceGitRepositoryFile() *schema.Resource {
 		Timeouts: &schema.ResourceTimeout{
 			Create: schema.DefaultTimeout(1 * time.Minute),
 			Read:   schema.DefaultTimeout(5 * time.Second),
+			Update: schema.DefaultTimeout(1 * time.Minute),
 		},
 	}
 }
 
 func resourceGitRepositoryPushArgs(d *schema.ResourceData, objectID string, changeType git.VersionControlChangeType, newContent *git.ItemContent) (*git.CreatePushArgs, error) {
 	var message *string
-	if commitMessage, hasCommitMessage := d.GetOk("comment"); hasCommitMessage {
+	if commitMessage, hasCommitMessage := d.GetOk("commit_message"); hasCommitMessage {
 		cm := commitMessage.(string)
 		message = &cm
 	}
@@ -170,7 +171,7 @@ func resourceGitRepositoryFileCreate(d *schema.ResourceData, m interface{}) erro
 		ContentType: &git.ItemContentTypeValues.RawText,
 	}
 
-	err = waitForFilePush(clients, d, &repo, &branch, &file, changeType, newContent)
+	err = waitForFilePush(clients, d, &repo, &branch, &file, changeType, newContent, d.Timeout(schema.TimeoutCreate))
 	if err != nil {
 		return err
 	}
@@ -221,7 +222,7 @@ func resourceGitRepositoryFileRead(d *schema.ResourceData, m interface{}) error 
 			return resource.NonRetryableError(err)
 		}
 
-		d.Set("comment", commit.Comment)
+		d.Set("commit_message", commit.Comment)
 
 		return nil
 	})
@@ -229,7 +230,6 @@ func resourceGitRepositoryFileRead(d *schema.ResourceData, m interface{}) error 
 
 func resourceGitRepositoryFileUpdate(d *schema.ResourceData, m interface{}) error {
 	clients := m.(*client.AggregatedClient)
-	ctx := context.Background()
 
 	repo := d.Get("repository_id").(string)
 	file := d.Get("file").(string)
@@ -239,28 +239,13 @@ func resourceGitRepositoryFileUpdate(d *schema.ResourceData, m interface{}) erro
 		return err
 	}
 
-	objectID, err := getLastCommitId(clients, repo, branch)
-	if err != nil {
-		return err
-	}
-
 	content := d.Get("content").(string)
 	newContent := &git.ItemContent{
 		Content:     &content,
 		ContentType: &git.ItemContentTypeValues.RawText,
 	}
 
-	args, err := resourceGitRepositoryPushArgs(d, objectID, git.VersionControlChangeTypeValues.Edit, newContent)
-	if err != nil {
-		return err
-	}
-
-	if *(*args.Push.Commits)[0].Comment == fmt.Sprintf("Add %s", file) {
-		m := fmt.Sprintf("Update %s", file)
-		(*args.Push.Commits)[0].Comment = &m
-	}
-
-	_, err = clients.GitReposClient.CreatePush(ctx, *args)
+	err := waitForFilePush(clients, d, &repo, &branch, &file, git.VersionControlChangeTypeValues.Edit, newContent, d.Timeout(schema.TimeoutUpdate))
 	if err != nil {
 		return err
 	}
@@ -275,7 +260,7 @@ func resourceGitRepositoryFileDelete(d *schema.ResourceData, m interface{}) erro
 	file := d.Get("file").(string)
 	branch := d.Get("branch").(string)
 
-	err := waitForFilePush(clients, d, &repo, &branch, &file, git.VersionControlChangeTypeValues.Delete, nil)
+	err := waitForFilePush(clients, d, &repo, &branch, &file, git.VersionControlChangeTypeValues.Delete, nil, d.Timeout(schema.TimeoutDelete))
 	if err != nil {
 		return err
 	}
@@ -284,7 +269,7 @@ func resourceGitRepositoryFileDelete(d *schema.ResourceData, m interface{}) erro
 }
 
 // waitForFilePush watches an object (repository file) and waits for it to achieve the desired state
-func waitForFilePush(clients *client.AggregatedClient, d *schema.ResourceData, repo *string, branch *string, file *string, changeType git.VersionControlChangeType, newContent *git.ItemContent) error {
+func waitForFilePush(clients *client.AggregatedClient, d *schema.ResourceData, repo *string, branch *string, file *string, changeType git.VersionControlChangeType, newContent *git.ItemContent, timeout time.Duration) error {
 	ctx := context.Background()
 
 	stateConf := &resource.StateChangeConf{
@@ -322,7 +307,7 @@ func waitForFilePush(clients *client.AggregatedClient, d *schema.ResourceData, r
 
 			return state, state, nil
 		},
-		Timeout:                   600 * time.Second,
+		Timeout:                   timeout,
 		MinTimeout:                2 * time.Second,
 		Delay:                     0 * time.Second,
 		ContinuousTargetOccurence: 1,
