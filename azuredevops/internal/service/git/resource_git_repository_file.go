@@ -23,10 +23,10 @@ func ResourceGitRepositoryFile() *schema.Resource {
 		Importer: &schema.ResourceImporter{
 			State: func(d *schema.ResourceData, m interface{}) ([]*schema.ResourceData, error) {
 				parts := strings.Split(d.Id(), ":")
-				branch := "refs/heads/main"
+				branch := "refs/heads/master"
 
 				if len(parts) > 2 {
-					return nil, fmt.Errorf("Invalid ID specified. Supplied ID must be written as <repository>/<file path> (when branch is \"main\") or <repository>/<file path>:<branch>")
+					return nil, fmt.Errorf("Invalid ID specified. Supplied ID must be written as <repository>/<file path> (when branch is \"master\") or <repository>/<file path>:<branch>")
 				}
 
 				if len(parts) == 2 {
@@ -69,10 +69,10 @@ func ResourceGitRepositoryFile() *schema.Resource {
 				Type:        schema.TypeString,
 				Optional:    true,
 				ForceNew:    true,
-				Description: "The branch name, defaults to \"refs/heads/main\"",
-				Default:     "refs/heads/main",
+				Description: "The branch name, defaults to \"master\"",
+				Default:     "refs/heads/master",
 			},
-			"commit_message": {
+			"comment": {
 				Type:        schema.TypeString,
 				Optional:    true,
 				Computed:    true,
@@ -92,15 +92,14 @@ func ResourceGitRepositoryFile() *schema.Resource {
 	}
 }
 
-func resourceGitRepositoryPushArgs(d *schema.ResourceData, objectID string, changeType git.VersionControlChangeType) (*git.CreatePushArgs, error) {
+func resourceGitRepositoryPushArgs(d *schema.ResourceData, objectID string, changeType git.VersionControlChangeType, newContent *git.ItemContent) (*git.CreatePushArgs, error) {
 	var message *string
-	if commitMessage, hasCommitMessage := d.GetOk("commit_message"); hasCommitMessage {
+	if commitMessage, hasCommitMessage := d.GetOk("comment"); hasCommitMessage {
 		cm := commitMessage.(string)
 		message = &cm
 	}
 
 	repo := d.Get("repository_id").(string)
-	content := d.Get("content").(string)
 	file := d.Get("file").(string)
 	branch := d.Get("branch").(string)
 
@@ -109,10 +108,9 @@ func resourceGitRepositoryPushArgs(d *schema.ResourceData, objectID string, chan
 		Item: git.GitItem{
 			Path: &file,
 		},
-		NewContent: &git.ItemContent{
-			Content:     &content,
-			ContentType: &git.ItemContentTypeValues.RawText,
-		},
+	}
+	if newContent != nil {
+		change.NewContent = newContent
 	}
 
 	args := &git.CreatePushArgs{
@@ -161,38 +159,18 @@ func resourceGitRepositoryFileCreate(d *schema.ResourceData, m interface{}) erro
 	if item != nil {
 		if !overwriteOnCreate {
 			return fmt.Errorf("Refusing to overwrite existing file. Configure `overwrite_on_create` to `true` to override.")
+		} else {
+			changeType = git.VersionControlChangeTypeValues.Edit
 		}
-
-		changeType = git.VersionControlChangeTypeValues.Edit
 	}
 
-	err = resource.Retry(d.Timeout(schema.TimeoutCreate), func() *resource.RetryError {
-		objectID, err := getLastCommitId(clients, repo, branch)
-		if err != nil {
-			return resource.NonRetryableError(err)
-		}
+	content := d.Get("content").(string)
+	newContent := &git.ItemContent{
+		Content:     &content,
+		ContentType: &git.ItemContentTypeValues.RawText,
+	}
 
-		args, err := resourceGitRepositoryPushArgs(d, objectID, changeType)
-		if err != nil {
-			return resource.NonRetryableError(err)
-		}
-
-		if (*args.Push.Commits)[0].Comment == nil {
-			m := fmt.Sprintf("Add %s", file)
-			(*args.Push.Commits)[0].Comment = &m
-		}
-
-		_, err = clients.GitReposClient.CreatePush(ctx, *args)
-		if err != nil {
-			if utils.ResponseContainsStatusMessage(err, "has already been updated by another client") {
-				return resource.RetryableError(err)
-			} else {
-				return resource.NonRetryableError(err)
-			}
-		}
-
-		return nil
-	})
+	err = waitForFilePush(clients, d, &repo, &branch, &file, changeType, newContent)
 	if err != nil {
 		return err
 	}
@@ -243,7 +221,7 @@ func resourceGitRepositoryFileRead(d *schema.ResourceData, m interface{}) error 
 			return resource.NonRetryableError(err)
 		}
 
-		d.Set("commit_message", commit.Comment)
+		d.Set("comment", commit.Comment)
 
 		return nil
 	})
@@ -266,7 +244,13 @@ func resourceGitRepositoryFileUpdate(d *schema.ResourceData, m interface{}) erro
 		return err
 	}
 
-	args, err := resourceGitRepositoryPushArgs(d, objectID, git.VersionControlChangeTypeValues.Edit)
+	content := d.Get("content").(string)
+	newContent := &git.ItemContent{
+		Content:     &content,
+		ContentType: &git.ItemContentTypeValues.RawText,
+	}
+
+	args, err := resourceGitRepositoryPushArgs(d, objectID, git.VersionControlChangeTypeValues.Edit, newContent)
 	if err != nil {
 		return err
 	}
@@ -286,46 +270,66 @@ func resourceGitRepositoryFileUpdate(d *schema.ResourceData, m interface{}) erro
 
 func resourceGitRepositoryFileDelete(d *schema.ResourceData, m interface{}) error {
 	clients := m.(*client.AggregatedClient)
-	ctx := context.Background()
 
 	repo := d.Get("repository_id").(string)
 	file := d.Get("file").(string)
 	branch := d.Get("branch").(string)
-	message := fmt.Sprintf("Delete %s", file)
 
-	objectID, err := getLastCommitId(clients, repo, branch)
+	err := waitForFilePush(clients, d, &repo, &branch, &file, git.VersionControlChangeTypeValues.Delete, nil)
 	if err != nil {
 		return err
 	}
 
-	change := &git.GitChange{
-		ChangeType: &git.VersionControlChangeTypeValues.Delete,
-		Item: git.GitItem{
-			Path: &file,
-		},
-	}
+	return nil
+}
 
-	_, err = clients.GitReposClient.CreatePush(ctx, git.CreatePushArgs{
-		RepositoryId: &repo,
-		Push: &git.GitPush{
-			RefUpdates: &[]git.GitRefUpdate{
-				{
-					Name:        &branch,
-					OldObjectId: &objectID,
-				},
-			},
-			Commits: &[]git.GitCommitRef{
-				{
-					Comment: &message,
-					Changes: &[]interface{}{change},
-				},
-			},
-		},
-	})
-	if err != nil {
-		return err
-	}
+// waitForFilePush watches an object (repository file) and waits for it to achieve the desired state
+func waitForFilePush(clients *client.AggregatedClient, d *schema.ResourceData, repo *string, branch *string, file *string, changeType git.VersionControlChangeType, newContent *git.ItemContent) error {
+	ctx := context.Background()
 
+	stateConf := &resource.StateChangeConf{
+		Pending: []string{"Waiting"},
+		Target:  []string{"Synched"},
+		Refresh: func() (interface{}, string, error) {
+			state := "Waiting"
+			objectID, err := getLastCommitId(clients, *repo, *branch)
+			if err != nil {
+				return state, state, err
+			}
+
+			args, err := resourceGitRepositoryPushArgs(d, objectID, changeType, newContent)
+			if err != nil {
+				return state, state, err
+			}
+
+			if (*args.Push.Commits)[0].Comment == nil {
+				m := fmt.Sprintf("%s %s", changeType, *file)
+				(*args.Push.Commits)[0].Comment = &m
+			}
+
+			push, err := clients.GitReposClient.CreatePush(ctx, *args)
+			if err != nil {
+				if utils.ResponseContainsStatusMessage(err, "has already been updated by another client") {
+					return state, state, nil // return no error here (nil) indicating we want to retry the 'push'
+				} else {
+					return state, state, err
+				}
+			}
+
+			if *push.PushId > 0 {
+				state = "Synched"
+			}
+
+			return state, state, nil
+		},
+		Timeout:                   600 * time.Second,
+		MinTimeout:                2 * time.Second,
+		Delay:                     0 * time.Second,
+		ContinuousTargetOccurence: 1,
+	}
+	if _, err := stateConf.WaitForState(); err != nil {
+		return fmt.Errorf("Error retrieving expected branch for repository [%s]: %+v", *repo, err)
+	}
 	return nil
 }
 
@@ -342,6 +346,7 @@ func checkRepositoryBranchExists(c *client.AggregatedClient, repo, branch string
 
 // checkRepositoryFileExists tests if a file exists in a repository.
 func checkRepositoryFileExists(c *client.AggregatedClient, repo, file, branch string) error {
+	branch = strings.TrimPrefix(branch, "refs/heads/")
 	ctx := context.Background()
 	_, err := c.GitReposClient.GetItem(ctx, git.GetItemArgs{
 		RepositoryId: &repo,
@@ -351,13 +356,15 @@ func checkRepositoryFileExists(c *client.AggregatedClient, repo, file, branch st
 		},
 	})
 	if err != nil {
-		return nil
+		return err
 	}
 
 	return nil
 }
 
+// getLastCommitId gets the last commit on a repository and branch.
 func getLastCommitId(c *client.AggregatedClient, repo, branch string) (string, error) {
+	branch = strings.TrimPrefix(branch, "refs/heads/")
 	ctx := context.Background()
 	commits, err := c.GitReposClient.GetCommits(ctx, git.GetCommitsArgs{
 		RepositoryId: &repo,
@@ -374,6 +381,7 @@ func getLastCommitId(c *client.AggregatedClient, repo, branch string) (string, e
 	return *(*commits)[0].CommitId, nil
 }
 
+// splitRepoFilePath splits a path into 2 parts.
 func splitRepoFilePath(path string) (string, string) {
 	parts := strings.Split(path, "/")
 	return parts[0], strings.Join(parts[1:], "/")
