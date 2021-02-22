@@ -99,10 +99,8 @@ func resourceGitRepositoryPushArgs(d *schema.ResourceData, objectID string, chan
 		message = &cm
 	}
 
-	repo := d.Get("repository_id").(string)
 	content := d.Get("content").(string)
 	file := d.Get("file").(string)
-	branch := d.Get("branch").(string)
 
 	change := git.GitChange{
 		ChangeType: &changeType,
@@ -114,24 +112,7 @@ func resourceGitRepositoryPushArgs(d *schema.ResourceData, objectID string, chan
 			ContentType: &git.ItemContentTypeValues.RawText,
 		},
 	}
-
-	args := &git.CreatePushArgs{
-		RepositoryId: &repo,
-		Push: &git.GitPush{
-			RefUpdates: &[]git.GitRefUpdate{
-				{
-					Name:        &branch,
-					OldObjectId: &objectID,
-				},
-			},
-			Commits: &[]git.GitCommitRef{
-				{
-					Comment: message,
-					Changes: &[]interface{}{change},
-				},
-			},
-		},
-	}
+	args := createGitPushArgs(d, &objectID, message, &change)
 
 	return args, nil
 }
@@ -304,24 +285,9 @@ func resourceGitRepositoryFileDelete(d *schema.ResourceData, m interface{}) erro
 			Path: &file,
 		},
 	}
+	gitPushArgs := createGitPushArgs(d, &objectID, &message, change)
 
-	_, err = clients.GitReposClient.CreatePush(ctx, git.CreatePushArgs{
-		RepositoryId: &repo,
-		Push: &git.GitPush{
-			RefUpdates: &[]git.GitRefUpdate{
-				{
-					Name:        &branch,
-					OldObjectId: &objectID,
-				},
-			},
-			Commits: &[]git.GitCommitRef{
-				{
-					Comment: &message,
-					Changes: &[]interface{}{change},
-				},
-			},
-		},
-	})
+	_, err = clients.GitReposClient.CreatePush(ctx, *gitPushArgs)
 	if err != nil {
 		return err
 	}
@@ -377,4 +343,27 @@ func getLastCommitId(c *client.AggregatedClient, repo, branch string) (string, e
 func splitRepoFilePath(path string) (string, string) {
 	parts := strings.Split(path, "/")
 	return parts[0], strings.Join(parts[1:], "/")
+}
+
+func createGitPushArgs(d *schema.ResourceData, objectID *string, message *string, change *git.GitChange) *git.CreatePushArgs {
+	repo := d.Get("repository_id").(string)
+	branch := d.Get("branch").(string)
+
+	return &git.CreatePushArgs{
+		RepositoryId: &repo,
+		Push: &git.GitPush{
+			RefUpdates: &[]git.GitRefUpdate{
+				{
+					Name:        &branch,
+					OldObjectId: objectID,
+				},
+			},
+			Commits: &[]git.GitCommitRef{
+				{
+					Comment: message,
+					Changes: &[]interface{}{change},
+				},
+			},
+		},
+	}
 }
